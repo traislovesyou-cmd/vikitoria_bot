@@ -1,18 +1,24 @@
 dockerfile
-# Указываем базовый образ с Python 3.11
+# Используем официальный образ Python 3.11
 FROM python:3.11-slim
+
+# Устанавливаем системные зависимости для сборки
+RUN apt-get update && apt-get install -y \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
 
 # Устанавливаем рабочую директорию
 WORKDIR /app
 
-# Копируем зависимости
+# Копируем файл зависимостей
 COPY requirements.txt .
 
-# Устанавливаем зависимости
-RUN pip install --no-cache-dir -r requirements.txt
+# Устанавливаем Python зависимости
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Копируем весь проект
+# Копируем весь исходный код
 COPY . .
 
-# Команда для запуска бота
+# Запускаем бота
 CMD ["python", "bot.py"]
