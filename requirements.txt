@@ -1,4 +1,3 @@
 txt
 aiogram==3.0.0b7
 python-dotenv==1.0.0
-# aiohttp не нужно указывать явно, aiogram сам подтянет совместимую версию
