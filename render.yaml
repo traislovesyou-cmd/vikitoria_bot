@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: vikitoria-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: WEBHOOK_URL
+        fromService:
+          name: vikitoria-bot
+          type: web
+          property: url
