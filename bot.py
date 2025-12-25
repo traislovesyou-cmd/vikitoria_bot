@@ -519,17 +519,16 @@ async def admin_start_test_handler(callback: CallbackQuery):
         # КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: сразу просим представиться
         game_session.state = GameState.IN_GAME  # Игра начинается сразу!
         
-        await callback.message.edit_text(
+        await callback.message.answer(
             f"🎮 <b>Тест игры начат!</b>\n\n"
             f"Код тестовой комнаты: <code>{room_code}</code>\n\n"
             f"<b>Представьтесь:</b>\n"
-            f"Напишите ваше имя для начала игры:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Назад в админ-панель", callback_data="admin_panel")]
-            ])
+            f"Напишите ваше имя для начала игры:"
         )
         
         logger.info(f"✅ Админ-тест создан: {room_code}")
+        
+        await callback.answer("✅ Тест создан, введите имя")
     else:
         await callback.answer("❌ Доступ запрещён")
 
@@ -656,7 +655,7 @@ async def handle_text_message(message: Message):
                 player_name = text[:50]
                 game_session.player_names[user_id] = player_name
                 
-                await message.answer(f"✅ Отлично, {player_name}!")
+                await message.answer(f"✅ Отлично, {player_name}! Начинаем игру...")
                 
                 # ОТДЕЛЬНАЯ ЛОГИКА ДЛЯ АДМИН-ТЕСТА
                 if game_session.is_admin_test:
@@ -805,7 +804,7 @@ async def send_next_card(game_session: GameSession):
                 time_text = f"{minutes} мин" if minutes > 0 else f"{seconds} сек"
                 card_text += f"\n\n⏱️ <i>Время на выполнение: {time_text}</i>"
             
-            msg = await bot.send_message(
+            await bot.send_message(
                 player_id,
                 card_text,
                 reply_markup=performer_keyboard(card, card_id)
@@ -1390,15 +1389,26 @@ async def admin_reset_all_handler(callback: CallbackQuery):
         admin_test_rooms.clear()
         active_timers.clear()
         
-        await callback.message.edit_text(
-            "🔄 <b>Все данные сброшены!</b>\n\n"
-            "• Активные игры очищены\n"
-            "• Комнаты удалены\n"
-            "• Админ-тесты завершены\n"
-            "• Таймеры остановлены\n\n"
-            "<i>Бот готов к работе</i>",
-            reply_markup=admin_panel_keyboard()
-        )
+        try:
+            await callback.message.edit_text(
+                "🔄 <b>Все данные сброшены!</b>\n\n"
+                "• Активные игры очищены\n"
+                "• Комнаты удалены\n"
+                "• Админ-тесты завершены\n"
+                "• Таймеры остановлены\n\n"
+                "<i>Бот готов к работе</i>",
+                reply_markup=admin_panel_keyboard()
+            )
+        except Exception as e:
+            await callback.message.answer(
+                "🔄 <b>Все данные сброшены!</b>\n\n"
+                "• Активные игры очищены\n"
+                "• Комнаты удалены\n"
+                "• Админ-тесты завершены\n"
+                "• Таймеры остановлены\n\n"
+                "<i>Бот готов к работе</i>",
+                reply_markup=admin_panel_keyboard()
+            )
     else:
         await callback.answer("❌ Доступ запрещён")
 
