@@ -98,7 +98,7 @@ user_timers = {}
 # НОВОЕ: Хранение админ-сессий (режим тестирования с самим собой)
 admin_sessions = {}  # admin_id -> session_data
 
-# ========== КАРТОЧКИ (остаются без изменений) ==========
+# ========== КАРТОЧКИ ==========
 CARDS_DATA = {
     "white": [
         {"id": 1, "type": "question", "text": "Какая твоя самая бесполезная, но крутая суперспособность в быту?"},
@@ -157,7 +157,7 @@ def has_photo_in_text(text: str) -> bool:
     photo_words = ['фото', 'галере', 'снимок', 'фотограф']
     return any(word in text.lower() for word in photo_words)
 
-# ========== КЛАВИАТУРЫ (остаются без изменений) ==========
+# ========== КЛАВИАТУРЫ ==========
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Начать игру 🦉", callback_data="create_room")],
@@ -189,10 +189,13 @@ def partner_found_keyboard(is_creator: bool) -> InlineKeyboardMarkup:
         ])
 
 def performer_keyboard(card: Dict) -> InlineKeyboardMarkup:
+    """Клавиатура исполняющего (БЕЗ кнопки "Выполнил")"""
     buttons = []
-    buttons.append([InlineKeyboardButton(text="Выполнил ✅", callback_data="task_done")])
+    
+    # ТОЛЬКО кнопка "Пропустить" для исполнителя
     buttons.append([InlineKeyboardButton(text="Пропустить ➡️", callback_data="skip_card")])
     
+    # Специальные кнопки
     if has_timer_in_text(card["text"]):
         buttons.append([InlineKeyboardButton(text="Запустить таймер ⏱️", callback_data="start_timer")])
     
@@ -206,6 +209,7 @@ def performer_keyboard(card: Dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def waiter_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура ожидающего (ТОЛЬКО "Выполнено" и "Пропустить")"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Выполнено ✅", callback_data="task_done")],
         [InlineKeyboardButton(text="Пропустить ➡️", callback_data="skip_card")],
@@ -241,7 +245,19 @@ def admin_solo_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔙 Назад в админ-панель", callback_data="admin_panel")]
     ])
 
-# ========== АДМИН-КОМАНДЫ ==========
+# ========== ОБРАБОТЧИКИ КОМАНД ==========
+@router.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer(
+        "🦉 Добро пожаловать в Викиторию!\n\n"
+        "Игра для двоих, которая поможет стать ближе через:\n"
+        "• Разговоры и флирт 🤍\n"
+        "• Тактильные игры 💛\n"
+        "• Интимную глубину ❤️\n\n"
+        "Выберите действие:",
+        reply_markup=main_menu_keyboard()
+    )
+
 @router.message(Command("myid"))
 async def cmd_myid(message: Message):
     """Показать ID пользователя"""
@@ -258,7 +274,6 @@ async def cmd_admin(message: Message):
     user_id = message.from_user.id
     
     if ADMIN_ID and user_id == ADMIN_ID:
-        # Показываем админ-панель
         await message.answer(
             "🛠️ <b>Админ-панель Викитории</b>\n\n"
             "Здесь вы можете:\n"
@@ -270,13 +285,496 @@ async def cmd_admin(message: Message):
             reply_markup=admin_panel_keyboard()
         )
     else:
-        # Скрываем существование команды для обычных пользователей
         await message.answer("❌ Команда не найдена")
 
-# Обработчики админ-панели
+# ========== ОБРАБОТКА КОМНАТ И ИГР ==========
+@router.callback_query(F.data == "main_menu")
+async def main_menu_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    # Отменяем таймеры
+    if user_id in user_timers:
+        user_timers[user_id].cancel()
+        del user_timers[user_id]
+    
+    # Уведомляем партнера, если есть активная игра
+    if user_id in active_users:
+        user_data = active_users[user_id]
+        partner_id = user_data.get("partner_id")
+        
+        if partner_id and partner_id in active_users:
+            await bot.send_message(
+                partner_id,
+                "🦉 Партнер вышел в главное меню. Игра завершена.",
+                reply_markup=main_menu_keyboard()
+            )
+            if partner_id in user_timers:
+                user_timers[partner_id].cancel()
+                del user_timers[partner_id]
+            del active_users[partner_id]
+        
+        room_code = user_data.get("room_code")
+        if room_code and room_code in active_rooms:
+            del active_rooms[room_code]
+        
+        del active_users[user_id]
+    
+    await callback.message.edit_text(
+        "🦉 Выберите действие:",
+        reply_markup=main_menu_keyboard()
+    )
+
+@router.callback_query(F.data == "create_room")
+async def create_room_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    room_code = ''.join(random.choices(string.ascii_uppercase, k=6))
+    
+    active_users[user_id] = {
+        "state": GameState.WAITING_PARTNER.value,
+        "room_code": room_code,
+        "stage": GameStage.WHITE.value,
+        "created_at": datetime.now().isoformat()
+    }
+    
+    active_rooms[room_code] = {
+        "creator_id": user_id,
+        "created_at": datetime.now().isoformat()
+    }
+    
+    await callback.message.edit_text(
+        f"🦉 Игровая комната создана!\n\n"
+        f"Код для присоединения:\n"
+        f"<code>{room_code}</code>\n\n"
+        f"Отправьте этот код партнеру.\n"
+        f"Ожидание: 5 минут\n\n"
+        f"Партнер должен:\n"
+        f"1. Нажать 'Присоединиться к игре'\n"
+        f"2. Ввести код: {room_code}",
+        parse_mode="HTML",
+        reply_markup=waiting_partner_keyboard()
+    )
+    
+    await asyncio.sleep(300)
+    if room_code in active_rooms:
+        del active_rooms[room_code]
+        if user_id in active_users and active_users[user_id].get("room_code") == room_code:
+            del active_users[user_id]
+            try:
+                await callback.message.edit_text(
+                    "⏰ Время ожидания истекло. Комната удалена.",
+                    reply_markup=main_menu_keyboard()
+                )
+            except:
+                pass
+
+@router.callback_query(F.data == "join_room")
+async def join_room_handler(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "✏️ Введите 6-значный код комнаты (только английские буквы, например: ABCDEF):",
+        reply_markup=back_to_main_keyboard()
+    )
+
+@router.message(F.text.regexp(r'^[A-Z]{6}$'))
+async def process_room_code(message: Message):
+    room_code = message.text.upper()
+    user_id = message.from_user.id
+    
+    if room_code not in active_rooms:
+        await message.answer(
+            "❌ Комната не найдена. Возможно:\n"
+            "• Код введен неправильно\n"
+            "• Время ожидания истекло (5 минут)\n"
+            "• Комната уже началась\n\n"
+            "Попросите партнера создать новую комнату.",
+            reply_markup=main_menu_keyboard()
+        )
+        return
+    
+    if user_id in active_users:
+        await message.answer(
+            "❌ Вы уже участвуете в игре. Сначала завершите текущую.",
+            reply_markup=main_menu_keyboard()
+        )
+        return
+    
+    creator_id = active_rooms[room_code]["creator_id"]
+    
+    if creator_id not in active_users:
+        await message.answer(
+            "❌ Создатель комнаты больше не в сети.",
+            reply_markup=main_menu_keyboard()
+        )
+        del active_rooms[room_code]
+        return
+    
+    # Обновляем данные создателя комнаты
+    active_users[creator_id]["state"] = GameState.PARTNER_FOUND.value
+    active_users[creator_id]["partner_id"] = user_id
+    
+    # Создаем данные для присоединившегося
+    active_users[user_id] = {
+        "state": GameState.PARTNER_FOUND.value,
+        "room_code": room_code,
+        "partner_id": creator_id,
+        "stage": GameStage.WHITE.value
+    }
+    
+    # Удаляем комнату из поиска
+    del active_rooms[room_code]
+    
+    # Уведомляем создателя комнаты
+    creator_name = message.from_user.first_name
+    await bot.send_message(
+        creator_id,
+        f"🎉 Партнер {creator_name} присоединился!\n\n"
+        f"Теперь вы можете начать игру.",
+        reply_markup=partner_found_keyboard(is_creator=True)
+    )
+    
+    # Уведомляем присоединившегося
+    await message.answer(
+        f"✅ Вы присоединились к комнате!\n"
+        f"Ожидайте начала игры от создателя комнаты.",
+        reply_markup=partner_found_keyboard(is_creator=False)
+    )
+
+@router.callback_query(F.data == "start_game")
+async def start_game_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
+    if user_id not in active_users:
+        await callback.answer("❌ Ошибка: данные не найдены", show_alert=True)
+        return
+    
+    user_data = active_users[user_id]
+    partner_id = user_data.get("partner_id")
+    
+    if not partner_id or partner_id not in active_users:
+        await callback.answer("❌ Партнер не найден", show_alert=True)
+        return
+    
+    partner_data = active_users[partner_id]
+    
+    # Случайно определяем роли
+    is_user_performer = random.random() > 0.5
+    user_data["role"] = PlayerRole.PERFORMER.value if is_user_performer else PlayerRole.WAITER.value
+    partner_data["role"] = PlayerRole.WAITER.value if is_user_performer else PlayerRole.PERFORMER.value
+    
+    # Обновляем состояния
+    user_data["state"] = GameState.IN_GAME.value
+    partner_data["state"] = GameState.IN_GAME.value
+    
+    user_role_name = "Исполняющий" if user_data["role"] == PlayerRole.PERFORMER.value else "Ожидающий"
+    partner_role_name = "Исполняющий" if partner_data["role"] == PlayerRole.PERFORMER.value else "Ожидающий"
+    
+    # Уведомляем обоих игроков
+    await callback.message.edit_text(
+        f"🎮 Игра началась!\n\n"
+        f"Ваша роль: <b>{user_role_name}</b>\n"
+        f"Этап: Белая колода 🤍\n\n"
+        f"<i>Правила ролей:</i>\n"
+        f"• <b>Исполняющий</b> - выполняет задание (может пропустить)\n"
+        f"• <b>Ожидающий</b> - следит за выполнением (нажимает 'Выполнено')",
+        parse_mode="HTML"
+    )
+    
+    await bot.send_message(
+        partner_id,
+        f"🎮 Игра началась!\n\n"
+        f"Ваша роль: <b>{partner_role_name}</b>\n"
+        f"Этап: Белая колода 🤍\n\n"
+        f"<i>Правила ролей:</i>\n"
+        f"• <b>Исполняющий</b> - выполняет задание (может пропустить)\n"
+        f"• <b>Ожидающий</b> - следит за выполнением (нажимает 'Выполнено')",
+        parse_mode="HTML"
+    )
+    
+    # Раздаем первую карту исполнителю
+    performer_id = user_id if user_data["role"] == PlayerRole.PERFORMER.value else partner_id
+    await send_next_card(performer_id)
+
+async def send_next_card(user_id: int):
+    """Отправка следующей карточки исполнителю"""
+    if user_id not in active_users:
+        return
+    
+    user_data = active_users[user_id]
+    
+    if user_data["state"] != GameState.IN_GAME.value:
+        return
+    
+    # Получаем карту для текущего этапа
+    stage = GameStage(user_data["stage"])
+    card = get_random_card(stage)
+    user_data["current_card"] = card
+    
+    # Отправляем карту исполнителю
+    if user_data["role"] == PlayerRole.PERFORMER.value:
+        card_text = f"🎴 Ваше задание:\n\n{card['text']}"
+        
+        # Добавляем подсказку для карт с кубиком
+        if "кубик" in card["text"].lower():
+            card_text += "\n\n🎲 Используйте кнопку 'Бросить кубик'"
+        
+        await bot.send_message(user_id, card_text, reply_markup=performer_keyboard(card))
+        
+        # Отправляем ожидающему информацию о задании
+        partner_id = user_data.get("partner_id")
+        if partner_id and partner_id in active_users:
+            await bot.send_message(
+                partner_id,
+                f"🎴 Задание партнера:\n\n{card['text']}",
+                reply_markup=waiter_keyboard()
+            )
+
+# ========== ОБРАБОТКА ИГРОВЫХ ДЕЙСТВИЙ ==========
+@router.callback_query(F.data == "task_done")
+async def task_done_handler(callback: CallbackQuery):
+    """Задание выполнено (ТОЛЬКО для ожидающего)"""
+    user_id = callback.from_user.id
+    
+    if user_id not in active_users:
+        await callback.answer("❌ Ошибка: данные не найдены", show_alert=True)
+        return
+    
+    user_data = active_users[user_id]
+    
+    if user_data["role"] == PlayerRole.WAITER.value:
+        # Ожидающий подтверждает выполнение
+        await switch_roles(user_id)
+        await callback.answer("✅ Задание выполнено!")
+    else:
+        # Исполняющий пытается нажать "Выполнил" - этой кнопки у него нет по ТЗ
+        await callback.answer("❌ Вы исполняющий, а не ожидающий. Используйте 'Пропустить' если нужно", show_alert=True)
+
+@router.callback_query(F.data == "skip_card")
+async def skip_card_handler(callback: CallbackQuery):
+    """Пропуск текущей карточки"""
+    user_id = callback.from_user.id
+    
+    if user_id not in active_users:
+        await callback.answer("❌ Ошибка: данные не найдены", show_alert=True)
+        return
+    
+    user_data = active_users[user_id]
+    card = user_data.get("current_card", {})
+    
+    # Уведомляем партнера о пропуске
+    partner_id = user_data.get("partner_id")
+    if partner_id and partner_id in active_users:
+        await bot.send_message(
+            partner_id,
+            f"⏩ Партнер пропустил карточку:\n\n{card.get('text', '')}\n\n"
+            f"Теперь ваш ход!",
+            reply_markup=waiter_keyboard()
+        )
+    
+    # Меняем роли
+    await switch_roles(user_id)
+    await callback.answer("Карточка пропущена")
+
+async def switch_roles(user_id: int):
+    """Смена ролей между игроками"""
+    if user_id not in active_users:
+        return
+    
+    user_data = active_users[user_id]
+    partner_id = user_data.get("partner_id")
+    
+    if not partner_id or partner_id not in active_users:
+        return
+    
+    partner_data = active_users[partner_id]
+    
+    # Меняем роли
+    user_data["role"] = PlayerRole.WAITER.value if user_data["role"] == PlayerRole.PERFORMER.value else PlayerRole.PERFORMER.value
+    partner_data["role"] = PlayerRole.PERFORMER.value if user_data["role"] == PlayerRole.WAITER.value else PlayerRole.WAITER.value
+    
+    # Очищаем текущие карты
+    user_data["current_card"] = None
+    partner_data["current_card"] = None
+    
+    # Отправляем новую карту новому исполнителю
+    new_performer_id = user_id if user_data["role"] == PlayerRole.PERFORMER.value else partner_id
+    await send_next_card(new_performer_id)
+
+@router.callback_query(F.data == "start_timer")
+async def start_timer_handler(callback: CallbackQuery):
+    """Запуск таймера для задания (ИСПРАВЛЕННЫЙ)"""
+    user_id = callback.from_user.id
+    
+    if user_id not in active_users:
+        await callback.answer("❌ Ошибка", show_alert=True)
+        return
+    
+    user_data = active_users[user_id]
+    card = user_data.get("current_card", {})
+    text = card.get("text", "")
+    
+    # Парсим время из текста задания (КОРРЕКТНЫЙ алгоритм)
+    minutes = 0
+    seconds = 0
+    
+    # Ищем минуты
+    minute_match = re.search(r'(\d+)\s*минут[уы]?', text.lower())
+    if minute_match:
+        minutes = int(minute_match.group(1))
+    
+    # Ищем секунды
+    second_match = re.search(r'(\d+)\s*секунд[уы]?', text.lower())
+    if second_match:
+        seconds = int(second_match.group(1))
+    
+    # Если не нашли явного времени, пытаемся понять из контекста
+    if minutes == 0 and seconds == 0:
+        if '1 минуту' in text.lower():
+            minutes = 1
+        elif '30 секунд' in text.lower():
+            seconds = 30
+        elif '5 минут' in text.lower():
+            minutes = 5
+        elif '3 минуты' in text.lower():
+            minutes = 3
+        elif '2 минуты' in text.lower():
+            minutes = 2
+        else:
+            # Дефолт: 1 минута
+            minutes = 1
+    
+    total_seconds = minutes * 60 + seconds
+    
+    # Запускаем таймер
+    if user_id in user_timers:
+        user_timers[user_id].cancel()
+    
+    async def timer_task():
+        try:
+            # Отправляем начальное сообщение
+            time_display = f"{minutes} мин {seconds} сек" if minutes > 0 else f"{seconds} сек"
+            msg = await bot.send_message(user_id, f"⏱️ Таймер запущен: {time_display}")
+            
+            # Уведомляем партнера
+            partner_id = user_data.get("partner_id")
+            if partner_id:
+                await bot.send_message(partner_id, f"⏱️ Партнёр запустил таймер: {time_display}")
+            
+            # Правильные интервалы уведомлений
+            intervals = []
+            if total_seconds > 900:  # > 15 минут
+                intervals = list(range(total_seconds, 0, -300))  # каждые 5 минут
+            elif total_seconds > 120:  # > 2 минут
+                intervals = list(range(total_seconds, 0, -60))   # каждую минуту
+            elif total_seconds >= 60:  # от 1 до 2 минут
+                intervals = list(range(total_seconds, 0, -30))   # каждые 30 секунд
+            elif total_seconds > 20:   # от 20 до 60 секунд
+                intervals = list(range(total_seconds, 0, -10))   # каждые 10 секунд
+            elif total_seconds > 5:    # от 5 до 20 секунд
+                intervals = list(range(total_seconds, 0, -5))    # каждые 5 секунд
+            else:                      # меньше 5 секунд
+                intervals = list(range(total_seconds, 0, -1))    # каждую секунду
+            
+            # Логируем интервалы для отладки
+            logger.info(f"Таймер: {total_seconds}сек, интервалы: {intervals}")
+            
+            # Ждем и обновляем таймер
+            for remaining in intervals[1:]:
+                wait_time = intervals[0] - remaining
+                await asyncio.sleep(wait_time)
+                
+                # Форматируем оставшееся время
+                if remaining >= 60:
+                    mins = remaining // 60
+                    secs = remaining % 60
+                    time_str = f"{mins} мин {secs} сек"
+                else:
+                    time_str = f"{remaining} сек"
+                
+                await bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=msg.message_id,
+                    text=f"⏱️ Осталось: {time_str}"
+                )
+            
+            # Ждем последний интервал
+            await asyncio.sleep(intervals[0] if intervals else total_seconds)
+            
+            # Финальное сообщение
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=msg.message_id,
+                text="⏰ Время вышло!"
+            )
+            
+            # Уведомляем партнера
+            if partner_id:
+                await bot.send_message(partner_id, "⏰ Время партнёра вышло!")
+            
+        except asyncio.CancelledError:
+            # Таймер был отменен
+            try:
+                await bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=msg.message_id,
+                    text="⏹️ Таймер остановлен"
+                )
+            except:
+                pass
+        except Exception as e:
+            logger.error(f"Ошибка таймера: {e}")
+    
+    user_timers[user_id] = asyncio.create_task(timer_task())
+    
+    # Показываем сколько времени установлено
+    time_info = f"{minutes} мин {seconds} сек" if minutes > 0 else f"{seconds} сек"
+    await callback.answer(f"Таймер запущен на {time_info}")
+
+@router.callback_query(F.data == "roll_dice")
+async def roll_dice_handler(callback: CallbackQuery):
+    """Бросок кубика"""
+    dice_value = random.randint(1, 6)
+    
+    user_id = callback.from_user.id
+    if user_id in active_users:
+        user_data = active_users[user_id]
+        partner_id = user_data.get("partner_id")
+        
+        if partner_id:
+            await bot.send_message(
+                partner_id,
+                f"🎲 Партнер бросил кубик: выпало {dice_value}"
+            )
+    
+    await callback.answer(f"🎲 Выпало: {dice_value}", show_alert=True)
+
+@router.callback_query(F.data == "show_rules")
+async def show_rules_handler(callback: CallbackQuery):
+    rules = (
+        "📜 Правила игры 'Викитория':\n\n"
+        "🎯 Цель: Создать атмосферу для постепенного сближения\n\n"
+        "📋 Основные правила:\n"
+        "1. Всегда можно сказать 'Пропустить'\n"
+        "2. Уважайте границы друг друга\n"
+        "3. Говорите 'Ворчун!' если стало неловко\n"
+        "4. Описывайте ощущения через метафоры\n\n"
+        "🎴 Этапы игры:\n"
+        "• 🤍 Белый - Разговор и флирт\n"
+        "• 💛 Жёлтый - Тактильные игры\n"
+        "• ❤️ Красный - Интимная глубина\n\n"
+        "👥 Роли в игре:\n"
+        "• Исполняющий - выполняет задание (может пропустить)\n"
+        "• Ожидающий - следит за выполнением (нажимает 'Выполнено')\n\n"
+        "🔄 Как играть:\n"
+        "1. Один создаёт комнату, второй присоединяется\n"
+        "2. Исполняющий получает задание\n"
+        "3. Ожидающий следит за выполнением\n"
+        "4. После выполнения меняемся ролями"
+    )
+    
+    await callback.message.edit_text(rules, reply_markup=back_to_main_keyboard())
+
+# ========== АДМИН-ОБРАБОТЧИКИ ==========
 @router.callback_query(F.data == "admin_panel")
 async def admin_panel_handler(callback: CallbackQuery):
-    """Показать админ-панель"""
     if ADMIN_ID and callback.from_user.id == ADMIN_ID:
         await callback.message.edit_text(
             "🛠️ <b>Админ-панель Викитории</b>\n\n"
@@ -289,9 +787,7 @@ async def admin_panel_handler(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_solo_test")
 async def admin_solo_test_handler(callback: CallbackQuery):
-    """Тест одиночной игры"""
     if ADMIN_ID and callback.from_user.id == ADMIN_ID:
-        # Создаём админ-сессию
         admin_id = callback.from_user.id
         session_id = str(uuid.uuid4())[:8]
         
@@ -317,7 +813,6 @@ async def admin_solo_test_handler(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin_"))
 async def admin_select_deck_handler(callback: CallbackQuery):
-    """Выбор колоды для тестирования"""
     if ADMIN_ID and callback.from_user.id == ADMIN_ID:
         admin_id = callback.from_user.id
         
@@ -325,7 +820,6 @@ async def admin_select_deck_handler(callback: CallbackQuery):
             await callback.answer("❌ Сессия не найдена", show_alert=True)
             return
         
-        # Определяем выбранную колоду
         action = callback.data
         if "white" in action:
             deck = GameStage.WHITE
@@ -340,10 +834,8 @@ async def admin_select_deck_handler(callback: CallbackQuery):
             await callback.answer("❌ Неизвестная колода", show_alert=True)
             return
         
-        # Обновляем сессию
         admin_sessions[admin_id]["stage"] = deck.value
         
-        # Начинаем игру
         await callback.message.edit_text(
             f"🎮 <b>Тест одиночной игры</b>\n\n"
             f"Колода: {deck_name}\n"
@@ -352,13 +844,12 @@ async def admin_select_deck_handler(callback: CallbackQuery):
             parse_mode="HTML"
         )
         
-        # Отправляем первую карту
         await send_admin_card(admin_id)
     else:
         await callback.answer("❌ Доступ запрещён", show_alert=True)
 
 async def send_admin_card(admin_id: int):
-    """Отправить карту в админ-режиме"""
+    """Отправить карту в админ-режиме (СООБЩЕНИЯ ОТ ОБОИХ РОЛЕЙ)"""
     if admin_id not in admin_sessions:
         return
     
@@ -367,12 +858,26 @@ async def send_admin_card(admin_id: int):
     card = get_random_card(stage)
     session["current_card"] = card
     
+    # Определяем текст колоды
+    deck_names = {
+        "white": "Белая колода 🤍",
+        "yellow": "Жёлтая колода 💛", 
+        "red": "Красная колода ❤️"
+    }
+    deck_name = deck_names.get(session["stage"], "Неизвестная колода")
+    
     if session["current_role"] == PlayerRole.PERFORMER.value:
-        # Показываем карту "исполняющему"
-        card_text = f"🎴 <b>Ваше задание (исполняющий):</b>\n\n{card['text']}"
+        # ========== СООБЩЕНИЕ ДЛЯ ИСПОЛНЯЮЩЕГО ==========
+        card_text = (
+            f"🎴 <b>Ваше задание (ИСПОЛНЯЮЩИЙ)</b>\n"
+            f"Колода: {deck_name}\n\n"
+            f"{card['text']}\n\n"
+        )
         
         if "кубик" in card["text"].lower():
-            card_text += "\n\n🎲 <i>Используйте кнопку 'Бросить кубик'</i>"
+            card_text += "🎲 <i>Используйте кнопку 'Бросить кубик'</i>\n"
+        if has_timer_in_text(card["text"]):
+            card_text += "⏱️ <i>Используйте кнопку 'Запустить таймер'</i>\n"
         
         await bot.send_message(
             admin_id,
@@ -381,22 +886,85 @@ async def send_admin_card(admin_id: int):
             reply_markup=performer_keyboard(card)
         )
         
-        # "Партнёру" показываем только текст
-        partner_text = f"🎴 <b>Задание партнёра (ожидающий):</b>\n\n{card['text']}"
-        await bot.send_message(
-            admin_id,  # Отправляем в тот же чат, но как бы от лица партнёра
-            partner_text,
-            parse_mode="HTML"
+        # ========== СООБЩЕНИЕ "ОТ ПАРТНЁРА" (ОЖИДАЮЩЕГО) ==========
+        partner_text = (
+            f"👤 <b>Сообщение от партнёра (ОЖИДАЮЩИЙ)</b>\n"
+            f"Колода: {deck_name}\n\n"
+            f"<i>Я получил(а) задание:</i>\n{card['text']}\n\n"
+            f"<i>Я буду следить за выполнением. Когда выполните, я нажму 'Выполнено'.</i>"
         )
-    else:
-        # Если админ в роли ожидающего
+        
         await bot.send_message(
             admin_id,
-            f"⏳ <b>Вы в роли ожидающего</b>\n\n"
-            f"Ждите, пока партнёр выполнит задание.\n\n"
-            f"<i>Задание партнёра:</i>\n{card['text']}",
+            partner_text,
             parse_mode="HTML",
             reply_markup=waiter_keyboard()
+        )
+        
+        # ========== ТЕСТОВОЕ СООБЩЕНИЕ (что отправилось бы реальному партнёру) ==========
+        test_message = (
+            f"🔍 <b>ТЕСТОВОЕ СООБЩЕНИЕ</b> (отправлено бы партнёру)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎴 <b>Задание партнёра:</b>\n\n"
+            f"{card['text']}\n\n"
+            f"<i>Следите за выполнением.</i>"
+        )
+        
+        await bot.send_message(
+            admin_id,
+            test_message,
+            parse_mode="HTML"
+        )
+        
+    else:
+        # ========== СООБЩЕНИЕ ДЛЯ ОЖИДАЮЩЕГО ==========
+        waiter_text = (
+            f"⏳ <b>Вы в роли ОЖИДАЮЩЕГО</b>\n"
+            f"Колода: {deck_name}\n\n"
+            f"<i>Задание партнёра:</i>\n{card['text']}\n\n"
+            f"<i>Ждите, пока партнёр выполнит задание.</i>"
+        )
+        
+        await bot.send_message(
+            admin_id,
+            waiter_text,
+            parse_mode="HTML",
+            reply_markup=waiter_keyboard()
+        )
+        
+        # ========== СООБЩЕНИЕ "ОТ ПАРТНЁРА" (ИСПОЛНЯЮЩЕГО) ==========
+        performer_message = (
+            f"👤 <b>Сообщение от партнёра (ИСПОЛНЯЮЩИЙ)</b>\n"
+            f"Колода: {deck_name}\n\n"
+            f"<i>Я получил(а) задание и начинаю выполнение:</i>\n{card['text']}\n\n"
+        )
+        
+        if has_timer_in_text(card["text"]):
+            performer_message += f"⏱️ <i>Если нужно, я запущу таймер.</i>\n"
+        
+        await bot.send_message(
+            admin_id,
+            performer_message,
+            parse_mode="HTML"
+        )
+        
+        # ========== ТЕСТОВОЕ СООБЩЕНИЕ (что отправилось бы реальному партнёру) ==========
+        test_message = (
+            f"🔍 <b>ТЕСТОВОЕ СООБЩЕНИЕ</b> (отправлено бы партнёру)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎴 <b>Ваше задание:</b>\n\n"
+            f"{card['text']}\n\n"
+        )
+        
+        if "кубик" in card["text"].lower():
+            test_message += "🎲 <i>Используйте кнопку 'Бросить кубик'</i>\n"
+        if has_timer_in_text(card["text"]):
+            test_message += "⏱️ <i>Используйте кнопку 'Запустить таймер'</i>\n"
+        
+        await bot.send_message(
+            admin_id,
+            test_message,
+            parse_mode="HTML"
         )
 
 # НОВОЕ: Обработка игровых действий в админ-режиме
@@ -415,7 +983,7 @@ async def admin_game_action_handler(callback: CallbackQuery):
                 await switch_admin_roles(user_id)
                 await callback.answer("✅ Задание выполнено!")
             else:
-                await callback.answer("⏳ Ждите подтверждения партнёра", show_alert=True)
+                await callback.answer("❌ Вы исполняющий, а не ожидающий", show_alert=True)
         
         elif action == "skip_card":
             # Меняем роли
@@ -434,29 +1002,39 @@ async def admin_game_action_handler(callback: CallbackQuery):
         elif action == "start_timer":
             card = admin_sessions[user_id].get("current_card", {})
             text = card.get("text", "")
-            minutes = 5
+            minutes = 0
+            seconds = 0
             
-            time_match = re.search(r'(\d+)\s*минут', text)
-            if time_match:
-                minutes = int(time_match.group(1))
+            minute_match = re.search(r'(\d+)\s*минут[уы]?', text.lower())
+            if minute_match:
+                minutes = int(minute_match.group(1))
             
-            # Запускаем таймер
-            await callback.answer(f"Таймер запущен на {minutes} минут")
+            second_match = re.search(r'(\d+)\s*секунд[уы]?', text.lower())
+            if second_match:
+                seconds = int(second_match.group(1))
             
-            # Симуляция таймера
-            msg = await bot.send_message(user_id, f"⏱️ Таймер запущен: {minutes} мин")
-            await asyncio.sleep(2)  # Для теста сокращаем время
+            if minutes == 0 and seconds == 0:
+                minutes = 1  # дефолт для теста
+            
+            total_seconds = minutes * 60 + seconds
+            
+            # Для теста сокращаем время в 10 раз, чтобы не ждать
+            test_seconds = max(2, total_seconds // 10)
+            
+            await callback.answer(f"Тестовый таймер запущен на {test_seconds} сек")
+            
+            msg = await bot.send_message(user_id, f"⏱️ Тестовый таймер: {test_seconds} сек")
+            await asyncio.sleep(test_seconds)
             
             await bot.edit_message_text(
                 chat_id=user_id,
                 message_id=msg.message_id,
-                text="⏰ Время вышло! (тестовый таймер)"
+                text=f"⏰ Тестовое время вышло! (оригинал: {minutes} мин {seconds} сек)"
             )
     
     else:
-        # Если не в админ-сессии, используем обычную логику
-        # (оставлю тебе заполнить или оставить как есть)
-        await callback.answer("❌ Действие не обработано", show_alert=True)
+        # Если не в админ-сессии, пропускаем дальше
+        pass
 
 async def switch_admin_roles(admin_id: int):
     """Смена ролей в админ-режиме"""
@@ -487,7 +1065,6 @@ async def switch_admin_roles(admin_id: int):
 
 @router.callback_query(F.data == "admin_stats")
 async def admin_stats_handler(callback: CallbackQuery):
-    """Статистика бота"""
     if ADMIN_ID and callback.from_user.id == ADMIN_ID:
         active_users_count = len(active_users)
         active_rooms_count = len(active_rooms)
@@ -512,14 +1089,11 @@ async def admin_stats_handler(callback: CallbackQuery):
 
 @router.callback_query(F.data == "admin_reset_all")
 async def admin_reset_all_handler(callback: CallbackQuery):
-    """Сброс всех игр"""
     if ADMIN_ID and callback.from_user.id == ADMIN_ID:
-        # Очищаем все данные
         active_users.clear()
         active_rooms.clear()
         admin_sessions.clear()
         
-        # Отменяем все таймеры
         for timer in user_timers.values():
             timer.cancel()
         user_timers.clear()
@@ -536,22 +1110,6 @@ async def admin_reset_all_handler(callback: CallbackQuery):
         )
     else:
         await callback.answer("❌ Доступ запрещён", show_alert=True)
-
-# ========== ОБЫЧНЫЕ КОМАНДЫ (остаются без изменений) ==========
-@router.message(Command("start"))
-async def cmd_start(message: Message):
-    await message.answer(
-        "🦉 Добро пожаловать в Викиторию!\n\n"
-        "Игра для двоих, которая поможет стать ближе через:\n"
-        "• Разговоры и флирт 🤍\n"
-        "• Тактильные игры 💛\n"
-        "• Интимную глубину ❤️\n\n"
-        "Выберите действие:",
-        reply_markup=main_menu_keyboard()
-    )
-
-# ... (остальные обработчики остаются без изменений, как в предыдущей версии)
-# [Здесь должен быть весь остальной код из предыдущего bot.py]
 
 # ========== ЗАПУСК БОТА ==========
 async def main():
