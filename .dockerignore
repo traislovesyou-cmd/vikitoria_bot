@@ -1,4 +1,3 @@
-# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -7,20 +6,8 @@ __pycache__/
 env/
 venv/
 .venv/
-
-# IDE
 .idea/
 .vscode/
-*.swp
-*.swo
-
-# Git
 .git/
-.gitignore
-
-# Логи
 *.log
-
-# OS
 .DS_Store
-Thumbs.db
