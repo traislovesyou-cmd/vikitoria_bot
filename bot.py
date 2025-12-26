@@ -6,6 +6,10 @@ import string
 import re
 import threading
 import uuid
+import sys
+import json
+import signal
+import atexit
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime
 from enum import Enum
@@ -52,7 +56,24 @@ else:
 
 storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
-dp = Dispatcher(storage=storage)
+
+# ========== КАСТОМНЫЙ DISPATCHER ДЛЯ ОБРАБОТКИ КОНФЛИКТОВ ==========
+class SafeDispatcher(Dispatcher):
+    async def start_polling(self, *args, **kwargs):
+        try:
+            await super().start_polling(*args, **kwargs)
+        except Exception as e:
+            error_msg = str(e)
+            if "terminated by other getUpdates request" in error_msg or "Conflict" in error_msg:
+                logger.error("⚠️ Другой экземпляр бота уже запущен. Завершаю этот процесс.")
+                logger.info("💤 Ожидание 5 секунд перед завершением...")
+                await asyncio.sleep(5)
+                sys.exit(0)  # Корректно завершаем процесс
+            else:
+                logger.error(f"❌ Критическая ошибка: {error_msg}")
+                raise
+
+dp = SafeDispatcher(storage=storage)
 router = Router()
 dp.include_router(router)
 
@@ -148,6 +169,106 @@ active_rooms = {}  # room_code -> GameSession
 active_users = {}  # user_id -> room_code or GameState.WAITING_CODE.value
 active_timers = {}  # user_id -> timer_task
 admin_test_rooms = {}  # user_id -> room_code
+
+# ========== СОХРАНЕНИЕ СОСТОЯНИЯ ==========
+STATE_FILE = "bot_state.json"
+
+def save_state():
+    """Сохраняем состояние бота в файл"""
+    try:
+        state = {
+            "active_rooms": {},
+            "active_users": active_users,
+            "admin_test_rooms": admin_test_rooms,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # Преобразуем GameSession в словарь
+        for room_code, session in active_rooms.items():
+            state["active_rooms"][room_code] = {
+                "room_code": session.room_code,
+                "creator_id": session.creator_id,
+                "partner_id": session.partner_id,
+                "state": session.state.value,
+                "stage": session.stage.value,
+                "player_names": session.player_names,
+                "player_role": {str(k): v.value for k, v in session.player_role.items()},
+                "used_cards": session.used_cards,
+                "is_admin_test": session.is_admin_test,
+                "creation_time": session.creation_time.isoformat()
+            }
+        
+        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"💾 Состояние сохранено: {len(active_rooms)} комнат, {len(active_users)} пользователей")
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения состояния: {e}")
+
+def load_state():
+    """Загружаем состояние бота из файла"""
+    global active_rooms, active_users, admin_test_rooms
+    
+    try:
+        if not os.path.exists(STATE_FILE):
+            logger.info("📭 Файл состояния не найден, начинаем с чистого листа")
+            return
+        
+        with open(STATE_FILE, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+        
+        # Восстанавливаем простые данные
+        active_users = state.get("active_users", {})
+        admin_test_rooms = state.get("admin_test_rooms", {})
+        
+        # Восстанавливаем GameSession объекты
+        restored_rooms = {}
+        for room_code, session_data in state.get("active_rooms", {}).items():
+            try:
+                # Создаем GameSession
+                session = GameSession(
+                    room_code=session_data["room_code"],
+                    creator_id=session_data["creator_id"],
+                    is_admin_test=session_data["is_admin_test"]
+                )
+                
+                # Восстанавливаем поля
+                session.partner_id = session_data["partner_id"]
+                session.state = GameState(session_data["state"])
+                session.stage = GameStage(session_data["stage"])
+                session.player_names = session_data["player_names"]
+                session.used_cards = session_data["used_cards"]
+                session.creation_time = datetime.fromisoformat(session_data["creation_time"])
+                
+                # Восстанавливаем player_role
+                session.player_role = {}
+                for user_id_str, role_str in session_data["player_role"].items():
+                    session.player_role[int(user_id_str)] = PlayerRole(role_str)
+                
+                restored_rooms[room_code] = session
+                
+            except Exception as e:
+                logger.error(f"❌ Ошибка восстановления комнаты {room_code}: {e}")
+                continue
+        
+        active_rooms = restored_rooms
+        logger.info(f"📂 Состояние загружено: {len(active_rooms)} комнат, {len(active_users)} пользователей")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка загрузки состояния: {e}")
+        # Начинаем с чистого листа
+        active_rooms = {}
+        active_users = {}
+        admin_test_rooms = {}
+
+async def auto_save_worker():
+    """Фоновая задача для автосохранения каждую минуту"""
+    while True:
+        await asyncio.sleep(60)  # Сохраняем каждую минуту
+        save_state()
+
+# Регистрируем сохранение при завершении
+atexit.register(save_state)
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 def generate_room_code() -> str:
@@ -409,6 +530,41 @@ async def cmd_admin(message: Message):
     else:
         await message.answer("❌ Команда не найдена")
 
+@router.message(Command("restore"))
+async def cmd_restore(message: Message):
+    """Восстановить сессию после перезапуска"""
+    user_id = message.from_user.id
+    
+    if user_id in active_users:
+        room_code = active_users[user_id]
+        
+        if room_code in active_rooms:
+            game_session = active_rooms[room_code]
+            
+            if game_session.is_admin_test:
+                await message.answer(
+                    f"🔄 <b>Админ-тест восстановлен!</b>\n\n"
+                    f"Комната: <code>{room_code}</code>\n"
+                    f"Статус: {game_session.state.value}\n"
+                    f"Колода: {get_stage_name(game_session.stage)}\n\n"
+                    f"Игра продолжается..."
+                )
+                
+                # Если игра была прервана, продолжаем
+                if game_session.state == GameState.IN_GAME:
+                    await send_next_card(game_session)
+            else:
+                await message.answer(
+                    f"🔄 <b>Игра восстановлена!</b>\n\n"
+                    f"Комната: <code>{room_code}</code>\n"
+                    f"Партнер: {game_session.player_names.get(game_session.get_opponent_id(user_id), 'ожидается')}\n"
+                    f"Статус: {game_session.state.value}"
+                )
+        else:
+            await message.answer("❌ Комната не найдена в памяти")
+    else:
+        await message.answer("ℹ️ У вас нет активных сессий")
+
 @router.callback_query(F.data == "main_menu")
 async def main_menu_handler(callback: CallbackQuery):
     await callback.message.edit_text(
@@ -631,7 +787,7 @@ async def handle_text_message(message: Message):
             reply_markup=partner_found_keyboard(is_creator=False)
         )
     
-    # 2. Если игрок вводит свое имя (КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ЗДЕСЬ)
+    # 2. Если игрок вводит свое имя
     elif user_id in active_users:
         room_code = active_users[user_id]
         
@@ -1381,13 +1537,22 @@ async def admin_reset_all_handler(callback: CallbackQuery):
         admin_test_rooms.clear()
         active_timers.clear()
         
+        # Удаляем файл состояния
+        try:
+            if os.path.exists(STATE_FILE):
+                os.remove(STATE_FILE)
+                logger.info(f"🗑️ Файл состояния удален: {STATE_FILE}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка удаления файла состояния: {e}")
+        
         try:
             await callback.message.edit_text(
                 "🔄 <b>Все данные сброшены!</b>\n\n"
                 "• Активные игры очищены\n"
                 "• Комнаты удалены\n"
                 "• Админ-тесты завершены\n"
-                "• Таймеры остановлены\n\n"
+                "• Таймеры остановлены\n"
+                "• Файл состояния удален\n\n"
                 "<i>Бот готов к работе</i>",
                 reply_markup=admin_panel_keyboard()
             )
@@ -1397,7 +1562,8 @@ async def admin_reset_all_handler(callback: CallbackQuery):
                 "• Активные игры очищены\n"
                 "• Комнаты удалены\n"
                 "• Админ-тесты завершены\n"
-                "• Таймеры остановлены\n\n"
+                "• Таймеры остановлены\n"
+                "• Файл состояния удален\n\n"
                 "<i>Бот готов к работе</i>",
                 reply_markup=admin_panel_keyboard()
             )
@@ -1437,22 +1603,33 @@ async def main():
     logger.info("🚀 ЗАПУСК БОТА 'ВИКИТОРИЯ'")
     logger.info("=" * 60)
     
+    # Загружаем сохраненное состояние
+    load_state()
+    
     total_cards = sum(len(cards) for cards in CARDS_DATA.values())
     logger.info(f"📊 Карты: {total_cards} ({len(CARDS_DATA['white'])}🤍/{len(CARDS_DATA['yellow'])}💛/{len(CARDS_DATA['red'])}❤️)")
     
     if ADMIN_ID:
         logger.info(f"👑 Админ ID: {ADMIN_ID}")
     
+    # Запускаем автосохранение
+    asyncio.create_task(auto_save_worker())
+    
+    logger.info(f"📂 Восстановлено: {len(active_rooms)} комнат, {len(active_users)} пользователей")
     logger.info("✅ Бот запущен")
     logger.info("=" * 60)
     
     try:
         await dp.start_polling(bot)
     except KeyboardInterrupt:
-        logger.info("🛑 Бот остановлен")
+        logger.info("🛑 Бот остановлен пользователем")
+        save_state()
     except Exception as e:
         logger.error(f"❌ Ошибка запуска: {e}")
+        save_state()  # Сохраняем перед падением
         raise
+    finally:
+        save_state()  # Гарантированное сохранение
 
 if __name__ == "__main__":
     asyncio.run(main())
